@@ -19,7 +19,7 @@ Repository = "https://github.com/FreeOpcUa/opcua-client-gui"
 opcua-client = "uaclient.mainwindow:main"
 
 [dependency-groups]
-dev = ["mypy"]
+dev = ["mypy", "pyinstaller>=6.0"]
 
 [build-system]
 requires = ["setuptools>=61"]

@@ -9,3 +9,5 @@ run:
 	python3 app.py
 edit:
 	qtcreator uaclient/mainwindow_ui.ui
+build:
+	uv run build.py

@@ -1,4 +1,4 @@
-build*
+build/*
 MANIFEST
 .idea*
 htmlcov*
@@ -17,3 +17,5 @@ old
 dist
 *.egg-info
 *.swp
+app.spec
+opcua-client-gui.spec
