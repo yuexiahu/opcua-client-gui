@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QWidget,
 )
 
@@ -294,13 +295,23 @@ class Window(QMainWindow):
 
         self._address_list: list[str] = self.settings.value("address_list", ["opc.tcp://localhost:4840", "opc.tcp://localhost:53530/OPCUA/SimulationServer/"])
         self._address_list_max_count = int(self.settings.value("address_list_max_count", 10))
+        # Held while an Expand-All is in flight so the progress slots
+        # know which dialog to update. Cleared in _on_expand_completed.
+        self._expand_progress_dialog: QProgressDialog | None = None
 
         for addr in self._address_list:
             self.ui.addrComboBox.insertItem(100, addr)
 
         self.uaclient = UaClient()
 
-        self.tree_ui = TreeWidget(self.ui.treeView)
+        self.tree_ui = TreeWidget(
+            self.ui.treeView,
+            filter_widgets=[
+                self.ui.filterDisplayName,
+                self.ui.filterBrowseName,
+                self.ui.filterNodeId,
+            ],
+        )
         self.tree_ui.error.connect(self.show_error)
         self.setup_context_menu_tree()
         selection_model = self.ui.treeView.selectionModel()
@@ -322,6 +333,7 @@ class Window(QMainWindow):
         self.ui.actionCopyPath.triggered.connect(self.tree_ui.copy_path)
         self.ui.actionCopyNodeId.triggered.connect(self.tree_ui.copy_nodeid)
         self.ui.actionCall.triggered.connect(self.call_method)
+        self.ui.actionExpandAll.triggered.connect(self._on_expand_all)
 
         selection_model.selectionChanged.connect(self.show_attrs)
         self.ui.attrRefreshButton.clicked.connect(self.show_attrs)
@@ -447,12 +459,14 @@ class Window(QMainWindow):
             self.ui.actionUnsubscribeEvents,
             self.ui.actionCopyPath,
             self.ui.actionCopyNodeId,
+            self.ui.actionExpandAll,
         ):
             action.setEnabled(connected)
         if not connected:
             # _update_actions_state re-enables this on its own when the
             # next Method node is selected.
             self.ui.actionCall.setEnabled(False)
+            self.ui.actionExpandAll.setEnabled(False)
 
         if state == "reconnecting":
             self.ui.statusBar.show()
@@ -496,6 +510,16 @@ class Window(QMainWindow):
             self._address_list.pop(-1)
 
     def disconnect(self) -> None:
+        # Cancel any in-flight Expand-All *before* tearing the tree down,
+        # so an arriving batch doesn't try to write into a cleared model.
+        if self.tree_ui.is_expanding():
+            self.tree_ui.cancel_expand()
+        self.tree_ui.shutdown()
+        # If a progress dialog is still up, close it.
+        dialog = self._expand_progress_dialog
+        if dialog is not None:
+            self._expand_progress_dialog = None
+            dialog.reject()
         try:
             self.uaclient.disconnect()
         except Exception as ex:
@@ -550,6 +574,7 @@ class Window(QMainWindow):
         self._contextMenu = QMenu()
         self.addAction(self.ui.actionCopyPath)
         self.addAction(self.ui.actionCopyNodeId)
+        self.addAction(self.ui.actionExpandAll)
         self._contextMenu.addSeparator()
         self._contextMenu.addAction(self.ui.actionCall)
         self._contextMenu.addSeparator()
@@ -561,9 +586,84 @@ class Window(QMainWindow):
     def _update_actions_state(self, current: QModelIndex, previous: QModelIndex) -> None:
         node = self.get_current_node(current)
         self.ui.actionCall.setEnabled(False)
+        self.ui.actionExpandAll.setEnabled(False)
         if node:
             if node.read_node_class() == ua.NodeClass.Method:
                 self.ui.actionCall.setEnabled(True)
+            if node.read_node_class() == ua.NodeClass.Object:
+                self.ui.actionExpandAll.setEnabled(True)
+
+    def _refresh_expand_all_action(self) -> None:
+        """Re-enable the Expand-All action iff the current node is still
+        an Object (mirrors the gate in :meth:`_update_actions_state`).
+        """
+        node = self.get_current_node()
+        enabled = node is not None and node.read_node_class() == ua.NodeClass.Object
+        self.ui.actionExpandAll.setEnabled(enabled)
+
+    @trycatchslot
+    def _on_expand_all(self) -> None:
+        if self.tree_ui.is_expanding():
+            return
+        node = self.get_current_node()
+        if not node or node.read_node_class() != ua.NodeClass.Object:
+            return
+        self.ui.actionExpandAll.setEnabled(False)
+        dialog = self._show_expand_progress()
+        self._expand_progress_dialog = dialog
+        # Wire signals before starting the worker, otherwise the first
+        # batch can land in the event queue *before* the connections are
+        # made and the dialog never gets dismissed / updated.
+        dialog.canceled.connect(self.tree_ui.cancel_expand)
+        self.tree_ui.expand_progress.connect(self._on_expand_progress, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
+        self.tree_ui.expand_completed.connect(self._on_expand_completed, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
+        # Drain pending events so the dialog is actually mapped to the
+        # screen *before* the worker emits its first batch. Without this,
+        # the tree visibly expands a few hundred ms (or a few seconds on
+        # a busy event loop) before the modal dialog appears, and the
+        # user can squeeze in a second click during that window.
+        QApplication.processEvents()
+        self.tree_ui.expand_all_async()
+
+    def _show_expand_progress(self) -> QProgressDialog:
+        # Indeterminate: the total node count is unknown, and a guessed
+        # total that the bar outruns looks worse than a busy indicator.
+        dialog = QProgressDialog("Expanding tree…\n0 nodes", "Cancel", 0, 0, self)
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        dialog.setWindowTitle("Expand All")
+        # Bouncing setValue(1)->setValue(0) is tempting (it walks the
+        # show path), but with setRange(0, 0) value 1 > max 0, which
+        # QProgressDialog treats as "complete" and auto-closes the
+        # dialog immediately. setMinimumDuration(0) already calls
+        # show() internally; ``_on_expand_all`` does a processEvents()
+        # right after construction so the dialog is actually mapped
+        # before the worker emits its first batch.
+        return dialog
+
+    @trycatchslot
+    def _on_expand_progress(self, visited: int, current_path: str) -> None:
+        dialog = self._expand_progress_dialog
+        if dialog is None:
+            return
+        path = current_path
+        if len(path) > 80:
+            path = path[:77] + "…"
+        dialog.setLabelText(f"Expanding tree…\n{visited} nodes — {path}")
+
+    @trycatchslot
+    def _on_expand_completed(self, status: str) -> None:
+        dialog = self._expand_progress_dialog
+        self._expand_progress_dialog = None
+        if dialog is not None:
+            if status == "cancelled":
+                dialog.setLabelText("Cancelled")
+                dialog.reject()
+            elif status == "error":
+                dialog.reject()
+            else:
+                dialog.accept()
+        self._refresh_expand_all_action()
 
     def _show_context_menu_tree(self, position: QPoint) -> None:
         node = self.tree_ui.get_current_node()

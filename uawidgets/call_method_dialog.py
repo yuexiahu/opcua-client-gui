@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class CallMethodDialog(QDialog):
-    def __init__(self, parent: QWidget | None, server: Any, parent_node, method_node: SyncNode) -> None:
+    def __init__(self, parent: QWidget | None, server: Any, parent_node: SyncNode, method_node: SyncNode) -> None:
         QDialog.__init__(self, parent)
         self.setWindowTitle("UA Method Call")
         self.server = server
