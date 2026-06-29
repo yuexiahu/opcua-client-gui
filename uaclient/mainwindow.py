@@ -495,6 +495,10 @@ class Window(QMainWindow):
 
         self._update_address_list(uri)
         assert self.uaclient.client is not None
+        # The BFS batch worker needs the sync ``Client`` to call
+        # ``browse_nodes``; the binding has to happen after connect
+        # since ``uaclient.client`` is ``None`` until then.
+        self.tree_ui.set_client(self.uaclient.client)
         self.tree_ui.set_root_node(self.uaclient.client.nodes.root)
         self.ui.treeView.setFocus()
         self.load_current_node()
@@ -526,6 +530,10 @@ class Window(QMainWindow):
             self.show_error(ex)
             raise
         finally:
+            # Drop the sync ``Client`` binding so a stale reference
+            # can't survive into the next ``connect``. ``set_client``
+            # will be called again on the next successful connect.
+            self.tree_ui.set_client(None)
             self.save_current_node()
             self.tree_ui.clear()
             self.refs_ui.clear()
@@ -609,6 +617,13 @@ class Window(QMainWindow):
         if not node or node.read_node_class() != ua.NodeClass.Object:
             return
         self.ui.actionExpandAll.setEnabled(False)
+        # Close any leftover dialog from a previous Expand-All run
+        # before creating a new one; otherwise it would stay on screen
+        # with a stale label.
+        stale = self._expand_progress_dialog
+        self._expand_progress_dialog = None
+        if stale is not None:
+            stale.reject()
         dialog = self._show_expand_progress()
         self._expand_progress_dialog = dialog
         # Wire signals before starting the worker, otherwise the first
@@ -617,12 +632,15 @@ class Window(QMainWindow):
         dialog.canceled.connect(self.tree_ui.cancel_expand)
         self.tree_ui.expand_progress.connect(self._on_expand_progress, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
         self.tree_ui.expand_completed.connect(self._on_expand_completed, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
-        # Drain pending events so the dialog is actually mapped to the
-        # screen *before* the worker emits its first batch. Without this,
-        # the tree visibly expands a few hundred ms (or a few seconds on
-        # a busy event loop) before the modal dialog appears, and the
-        # user can squeeze in a second click during that window.
+        # Drain pending events so the dialog's show event (queued by
+        # ``_show_expand_progress``) is actually painted before the
+        # worker starts. Without this the dialog only appears once
+        # the first progress signal lands, which is a few seconds on
+        # a real tree.
         QApplication.processEvents()
+        # Start the worker directly. The Browse call is on a separate
+        # thread, so the GUI thread stays free to run the dialog's
+        # event loop.
         self.tree_ui.expand_all_async()
 
     def _show_expand_progress(self) -> QProgressDialog:
@@ -630,15 +648,15 @@ class Window(QMainWindow):
         # total that the bar outruns looks worse than a busy indicator.
         dialog = QProgressDialog("Expanding tree…\n0 nodes", "Cancel", 0, 0, self)
         dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
-        dialog.setMinimumDuration(0)
         dialog.setWindowTitle("Expand All")
-        # Bouncing setValue(1)->setValue(0) is tempting (it walks the
-        # show path), but with setRange(0, 0) value 1 > max 0, which
-        # QProgressDialog treats as "complete" and auto-closes the
-        # dialog immediately. setMinimumDuration(0) already calls
-        # show() internally; ``_on_expand_all`` does a processEvents()
-        # right after construction so the dialog is actually mapped
-        # before the worker emits its first batch.
+        # ``setMinimumDuration`` is a no-op with setRange(0, 0) and no
+        # subsequent setValue() — the dialog only shows once the value
+        # *changes*, which here would only happen on the first progress
+        # signal from the worker (potentially seconds later on a big
+        # tree). Force the show so the user sees the dialog immediately
+        # on click; ``_on_expand_all`` drains the show event with
+        # processEvents() before the worker starts.
+        dialog.show()
         return dialog
 
     @trycatchslot

@@ -1,6 +1,11 @@
 import logging
+from collections import deque
 from dataclasses import dataclass
 from typing import Iterable
+
+from asyncua.sync import Client as SyncClient, sync_wrapper
+from asyncua.client.ua_client import UaClient as _AsyncUaClient
+from asyncua.ua import BrowseNextParameters, BrowseParameters, BrowseDescription, BrowseDirection, BrowseResultMask, ObjectIds, NodeClass
 
 from PyQt6.QtCore import (
     pyqtSignal,
@@ -94,6 +99,12 @@ class TreeWidget(QObject):
         self.view = view
         self.model = TreeViewModel()
         self.model.error.connect(self.error)
+        # Late-bound: Window calls ``set_client`` after the underlying
+        # ``UaClient.connect`` succeeds, since the sync ``Client`` is
+        # None until that point. The expand-all worker needs a non-None
+        # client to call ``browse_nodes``; ``expand_all_async`` no-ops
+        # if it isn't set.
+        self._client: SyncClient | None = None
 
         self.model.setHorizontalHeaderLabels(['DisplayName', "BrowseName", 'NodeId'])
         # Clamp icon rendering size; the bundled SVGs lack viewBox attributes
@@ -139,6 +150,15 @@ class TreeWidget(QObject):
         if header is not None:
             self.settings.setValue(_HEADER_STATE_KEY, header.saveState())
 
+    def set_client(self, client: SyncClient | None) -> None:
+        """Bind the sync ``Client`` used by the BFS batch worker.
+
+        Called from ``Window.connect`` after the underlying ``UaClient``
+        finishes handshaking, since the sync ``Client`` is ``None`` until
+        then. Safe to call again on reconnect to refresh the binding.
+        """
+        self._client = client
+
     def clear(self) -> None:
         self.model.clear()
 
@@ -177,6 +197,14 @@ class TreeWidget(QObject):
         """
         if self._is_expanding:
             return
+        if self._client is None:
+            # BFS batch worker needs the sync ``Client``; if Window
+            # forgot to call ``set_client`` after connect, we silently
+            # give up rather than crash on a None dereference inside
+            # the worker.
+            logger.error("expand_all_async: no client bound; was set_client() called?")
+            self.expand_completed.emit("error")
+            return
         # QAction.triggered hands us a bool (the checked state); ignore
         # it and fall back to the current row.
         if not isinstance(idx, QModelIndex):
@@ -195,7 +223,7 @@ class TreeWidget(QObject):
             return
         # Spin up a fresh worker + thread per call; auto-cleanup on
         # completion. ~10 ms spin-up cost is dwarfed by server RTT.
-        self._worker = _ExpandAllWorker()
+        self._worker = _ExpandAllWorker(self._client)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -231,33 +259,43 @@ class TreeWidget(QObject):
         thread = self._thread
         self._thread = None
         self._worker = None
-        thread.quit()
+        try:
+            thread.quit()
+        except RuntimeError:
+            # The worker already finished and the ``thread.finished``
+            # → ``_thread.deleteLater`` chain already ran. Nothing to
+            # stop.
+            return
         # Bounded wait so a wedged worker can't hang app shutdown.
         thread.wait(2000)
 
     @pyqtSlot(object)
     def _on_fetch_requested(self, payload: object) -> None:
-        """GUI-side handler: install a batch of children and expand them."""
+        """GUI-side handler: install one BFS layer's children and expand them."""
         if not isinstance(payload, _FetchBatch):
             return
         if self._worker is not None and self._worker._cancelled:
             # Cancel landed mid-flight; drop the batch and let the worker's
             # ``finished("cancelled")`` tear things down.
             return
-        try:
-            self.model.add_fetched_children(payload.parent_node, payload.descs)
-        except KeyError:
-            # Disconnect / clear raced with the worker. Nothing to install;
-            # the worker will wind down on its own.
-            return
-        # Mirror the recursive walk: expand the parent now that the
-        # children are in the model, so the user sees the tree fill in.
-        source_idx = self.model.index_of_node(payload.parent_node)
-        if source_idx is None:
-            return
-        proxy_idx = self._source_to_proxy(source_idx)
-        if proxy_idx.isValid():
-            self.view.setExpanded(proxy_idx, True)
+        for parent_node, descs in payload.groups:
+            try:
+                self.model.add_fetched_children(parent_node, descs)
+            except KeyError:
+                # Disconnect / clear raced with the worker. Nothing to
+                # install for this parent; keep going for the rest of
+                # the layer in case their rows are still valid.
+                continue
+            # Expand the parent now that the children are in the model
+            # so the user sees the tree fill in. In BFS the parent
+            # may already be expanded (it had to be to be in the
+            # worker's batch at all), but ``setExpanded`` is idempotent.
+            source_idx = self.model.index_of_node(parent_node)
+            if source_idx is None:
+                continue
+            proxy_idx = self._source_to_proxy(source_idx)
+            if proxy_idx.isValid():
+                self.view.setExpanded(proxy_idx, True)
 
     @pyqtSlot(str)
     def _on_worker_finished(self, status: str) -> None:
@@ -645,16 +683,17 @@ class TreeViewModel(QStandardItemModel):
 
 @dataclass(frozen=True)
 class _FetchBatch:
-    """One node's worth of children, emitted by :class:`_ExpandAllWorker`.
+    """One BFS layer's worth of children, emitted by :class:`_ExpandAllWorker`.
 
-    A single ``fetch_requested`` signal carries both the parent node (so
-    the GUI can find the row in the model) and its freshly-fetched
-    descriptions. Sending both in one payload keeps the signal traffic
-    to one message per parent visited, regardless of child count.
+    A single ``fetch_requested`` signal carries the children fetched for
+    every parent the worker browsed in the most recent batch. Each
+    ``groups`` entry is a ``(parent_node, descs)`` pair the GUI uses to
+    install rows under the correct parent. Bundling the whole layer
+    keeps the signal traffic to one message per BFS round, regardless
+    of how many parents were bundled in the underlying ``Browse`` call.
     """
 
-    parent_node: SyncNode
-    descs: list[ua.ReferenceDescription]
+    groups: list[tuple[SyncNode, list[ua.ReferenceDescription]]]
     current_path: str
 
 
@@ -665,26 +704,60 @@ class _ExpandAllWorker(QObject):
     signals. The GUI thread turns each ``fetch_requested`` into model
     rows and ``setExpanded`` calls.
 
-    Iterative DFS over a stack so deep trees don't blow Python's stack.
-    A ``_browsed`` set keyed on the NodeId (not Python ``id()``) skips
-    nodes the worker has already walked. Keying on Python id is wrong:
-    ``new_node`` builds a fresh wrapper every time, so the same logical
-    node would land on the stack under different object identities when
-    an OPC UA server exposes the same NodeId via multiple back-reference
-    paths. Without NodeId-based dedup the worker would re-browse the
-    node and the GUI would append a second set of child rows.
+    Iterative BFS over a deque. Each round pops up to ``BATCH_SIZE``
+    parents and submits them to ``Client.browse_nodes`` in a single
+    Browse service call (the "batch interface" the optimisation was
+    after). Children are then appended to the back of the deque; the
+    loop ends when the deque is empty. NodeId-keyed dedup is shared
+    with the previous DFS implementation: ``new_node`` builds a fresh
+    wrapper every time, so the same logical node can appear under
+    different Python ``id()``s and must be deduped by NodeId, not by
+    object identity.
+
+    Per-parent continuation points: ``Client.browse_nodes`` does not
+    loop ``browse_next`` (it always sets
+    ``RequestedMaxReferencesPerNode=0`` and stops at the first page).
+    When the server returns a non-empty ``ContinuationPoint`` for one
+    of the batched parents we follow it with a per-parent
+    ``browse_next`` call. The main batched request itself stays
+    un-changed; only the per-parent overflow is unbatched. This
+    matches ``Node.get_children_descriptions``'s semantics (which is
+    the one-at-a-time path the existing tree uses for its lazy load)
+    so we don't silently drop children for any node whose reference
+    count exceeds the server's per-page cap.
     """
+
+    BATCH_SIZE = 50
 
     fetch_requested = pyqtSignal(object)  # _FetchBatch
     progress = pyqtSignal(int, str)  # (visited_count, current_path)
     finished = pyqtSignal(str)  # "ok" | "cancelled" | "error"
     failed = pyqtSignal(object)  # Exception
 
-    def __init__(self) -> None:
+    def __init__(self, client: SyncClient) -> None:
         super().__init__()
+        self._client = client
+        # ``_sync_browse`` is the synchronous wrapper around the
+        # async ``UaClient.browse`` coroutine, bound to the same
+        # threadloop the rest of the app uses. ``browse_next`` is
+        # symmetric; both must be invoked from the worker thread
+        # via this binding so the request goes through the same
+        # event loop the connection was opened on. The pattern
+        # mirrors asyncua's own ``sync_uaclient_method`` helper:
+        # ``sync_wrapper`` takes the unbound method and we feed
+        # the uaclient in as the implicit ``self`` via
+        # ``functools.partial``.
+        import functools
+        uaclient = client.aio_obj.uaclient
+        self._sync_browse = functools.partial(
+            sync_wrapper(_AsyncUaClient.browse), client.tloop, uaclient
+        )
+        self._sync_browse_next = functools.partial(
+            sync_wrapper(_AsyncUaClient.browse_next), client.tloop, uaclient
+        )
         self._cancelled: bool = False
         self._browsed: set[str] = set()  # NodeId.to_string() values
-        self._stack: list[SyncNode] = []
+        self._queue: deque[SyncNode] = deque()
         self._visited: int = 0
 
     @pyqtSlot()
@@ -698,53 +771,155 @@ class _ExpandAllWorker(QObject):
         """Reset state for a fresh expand-all rooted at ``root_node``."""
         self._cancelled = False
         self._browsed = set()
-        self._stack = [root_node]
+        self._queue = deque([root_node])
         self._visited = 0
+
+    def _browse_next_for(self, continuation_point: bytes) -> ua.BrowseResult | None:
+        """Follow a single BrowseNext continuation point to completion.
+
+        Mirrors ``Node._browse_next`` from asyncua but used here from
+        the worker thread, one parent at a time. Returns ``None`` if
+        the server signals cancellation; otherwise the final
+        ``BrowseResult`` with an empty ``ContinuationPoint``.
+        """
+        params = BrowseNextParameters()
+        params.ContinuationPoints = [continuation_point]
+        params.ReleaseContinuationPoints = False
+        try:
+            results = self._sync_browse_next(params)
+        except Exception as ex:
+            logger.warning("browse_next failed: %s", ex)
+            return None
+        if not results:
+            return None
+        return results[0]
+
+    def _browse_hierarchical(
+        self, parents: list[SyncNode]
+    ) -> list[tuple[SyncNode, ua.BrowseResult]]:
+        """One Browse call restricted to forward HierarchicalReferences.
+
+        ``Client.browse_nodes`` is unsuitable for the expand-all
+        walk: it sets ``ReferenceTypeId=Null`` on every
+        ``BrowseDescription`` and the server then returns edges of
+        every reference type — including HasTypeDefinition, which
+        points at the type definition of each node and shows up in
+        the tree as an extra "BaseObjectType" / "BaseDataVariableType"
+        child row. This helper reproduces the per-node behaviour of
+        ``Node.get_children_descriptions`` (which sets
+        ``ReferenceTypeId=HierarchicalReferences`` and
+        ``BrowseDirection=Forward``) but in a single batched call.
+        """
+        params = BrowseParameters()
+        params.View = ua.ViewDescription()
+        params.RequestedMaxReferencesPerNode = 0
+        params.NodesToBrowse = []
+        for node in parents:
+            desc = BrowseDescription()
+            desc.NodeId = node.nodeid
+            desc.BrowseDirection = BrowseDirection.Forward
+            desc.ReferenceTypeId = ua.TwoByteNodeId(ObjectIds.HierarchicalReferences)
+            desc.IncludeSubtypes = True
+            desc.NodeClassMask = NodeClass.Unspecified
+            desc.ResultMask = BrowseResultMask.All
+            params.NodesToBrowse.append(desc)
+        results = self._sync_browse(params)
+        return list(zip(parents, results))
 
     @pyqtSlot()
     def run(self) -> None:
         try:
-            while self._stack:
+            while self._queue:
                 if self._cancelled:
                     self.finished.emit("cancelled")
                     return
-                node = self._stack.pop()
-                # Key by NodeId, not id(node): see class docstring.
-                node_key = node.nodeid.to_string()
-                if node_key in self._browsed:
-                    continue
-                self._browsed.add(node_key)
 
+                # Pop up to BATCH_SIZE parents from the front of the
+                # deque, skipping any NodeId we've already walked.
+                batch: list[SyncNode] = []
+                while self._queue and len(batch) < self.BATCH_SIZE:
+                    node = self._queue.popleft()
+                    node_key = node.nodeid.to_string()
+                    if node_key in self._browsed:
+                        continue
+                    self._browsed.add(node_key)
+                    batch.append(node)
+                if not batch:
+                    continue
+
+                # One Browse service call covering every parent in the
+                # batch. We can't use ``Client.browse_nodes`` here
+                # because that helper sets ``ReferenceTypeId=Null``
+                # (i.e. all reference types), which causes the server
+                # to return HasTypeDefinition edges as if they were
+                # children — every Object/Variable would gain an extra
+                # "BaseObjectType" / "BaseDataVariableType" row under
+                # it. ``Node.get_children_descriptions`` solves the
+                # same problem by passing
+                # ``ReferenceTypeId=HierarchicalReferences`` and
+                # ``Direction=Forward``; we mirror that exactly so the
+                # BFS view matches what the lazy-load view shows.
                 try:
-                    descs = node.get_children_descriptions()
+                    results = self._browse_hierarchical(batch)
                 except Exception as ex:
-                    logger.warning("Expand-all failed at %s: %s", node, ex)
+                    logger.warning("Expand-all batch browse failed: %s", ex)
                     self.failed.emit(ex)
                     self.finished.emit("error")
                     return
-                # Match _fetchMore's BrowseName ordering and de-duplicate
-                # by NodeId so duplicate child rows don't end up in the
-                # tree (some servers return the same reference twice).
-                descs.sort(key=lambda x: x.BrowseName)
-                seen: set[ua.NodeId] = set()
-                deduped: list[ua.ReferenceDescription] = []
-                for d in descs:
-                    if d.NodeId in seen:
+
+                groups: list[tuple[SyncNode, list[ua.ReferenceDescription]]] = []
+                for parent, br in results:
+                    if not br.StatusCode.is_good():
+                        logger.warning(
+                            "Browse for %s returned %s; skipping",
+                            parent.nodeid, br.StatusCode,
+                        )
                         continue
-                    seen.add(d.NodeId)
-                    deduped.append(d)
-                descs = deduped
+                    descs = list(br.References)
+                    cont = br.ContinuationPoint
+                    while cont:
+                        if self._cancelled:
+                            self.finished.emit("cancelled")
+                            return
+                        next_br = self._browse_next_for(cont)
+                        if next_br is None:
+                            break
+                        descs.extend(next_br.References)
+                        cont = next_br.ContinuationPoint
+                    # Match _fetchMore's BrowseName ordering and
+                    # de-duplicate by NodeId so duplicate child rows
+                    # don't end up in the tree (some servers return
+                    # the same reference twice). Sort on the qualified
+                    # name components rather than the QualifiedName
+                    # itself: a few server implementations return
+                    # BrowseName=None, and QualifiedName's __lt__ on
+                    # a None ``Name`` raises TypeError. In BFS a
+                    # single bad reference in a batch would otherwise
+                    # abort the whole layer.
+                    descs.sort(key=_browse_name_sort_key)
+                    seen: set[ua.NodeId] = set()
+                    deduped: list[ua.ReferenceDescription] = []
+                    for d in descs:
+                        if d.NodeId in seen:
+                            continue
+                        seen.add(d.NodeId)
+                        deduped.append(d)
+                    groups.append((parent, deduped))
+                    for d in deduped:
+                        self._queue.append(new_node(parent, d.NodeId))
 
-                current_path = _format_path(node)
-
+                if self._cancelled:
+                    self.finished.emit("cancelled")
+                    return
+                # The current_path is purely cosmetic; reporting the
+                # first parent in the batch is enough to show the
+                # user roughly where the walk is.
+                current_path = _format_path(batch[0])
                 self.fetch_requested.emit(
-                    _FetchBatch(parent_node=node, descs=descs, current_path=current_path)
+                    _FetchBatch(groups=groups, current_path=current_path)
                 )
+                self._visited += len(batch)
                 self.progress.emit(self._visited, current_path)
-                self._visited += 1
-
-                for desc in descs:
-                    self._stack.append(new_node(node, desc.NodeId))
             self.finished.emit("ok")
         except Exception as ex:
             # Defensive: anything that escapes the inner try above
@@ -752,6 +927,23 @@ class _ExpandAllWorker(QObject):
             logger.exception("Expand-all worker crashed")
             self.failed.emit(ex)
             self.finished.emit("error")
+
+
+def _browse_name_sort_key(desc: ua.ReferenceDescription) -> tuple[int, str, str]:
+    """Sort key for ``ReferenceDescription`` by BrowseName that tolerates None.
+
+    Some OPC-UA servers return a ``BrowseName`` whose ``Name`` field is
+    ``None`` (e.g. when the type definition is missing). Sorting on
+    the bare ``QualifiedName`` would raise ``TypeError`` from
+    ``QualifiedName.__lt__``; sorting on a tuple of namespace index +
+    name string falls back to a stable secondary order and never
+    raises. Empty string sorts before non-empty, so a None browse
+    name lands at the top of the parent.
+    """
+    bn = desc.BrowseName
+    if bn is None:
+        return (-1, "", desc.NodeId.to_string())
+    return (bn.NamespaceIndex, bn.Name or "", desc.NodeId.to_string())
 
 
 def _format_path(node: SyncNode) -> str:
