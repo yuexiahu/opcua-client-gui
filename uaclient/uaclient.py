@@ -1,6 +1,8 @@
 import logging
+import socket
 from pathlib import Path
 from typing import Any, Callable, Literal
+from urllib.parse import urlparse, urlunparse
 
 from PyQt6.QtCore import QObject, QSettings, QStandardPaths, pyqtSignal
 
@@ -11,6 +13,40 @@ from asyncua.tools import endpoint_to_strings
 
 
 logger = logging.getLogger(__name__)
+
+
+def _force_ipv4_hostname(uri: str) -> str:
+    """Resolve the URI hostname to an IPv4 literal so Windows Proactor
+    doesn't burn its connect timeout trying ::1 first.
+
+    IP literals (v4 / v6) and unresolvable hostnames are returned
+    unchanged so we don't lock out IPv6-only setups.
+    """
+    parsed = urlparse(uri)
+    host = parsed.hostname
+    if host is None:
+        return uri
+    # IP literals bypass DNS resolution; leave them alone.
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, host)
+            return uri
+        except OSError:
+            continue
+    try:
+        infos = socket.getaddrinfo(host, parsed.port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return uri
+    if not infos:
+        return uri
+    ipv4 = infos[0][4][0]
+    userinfo = ""
+    if parsed.username:
+        userinfo = parsed.username + (f":{parsed.password}" if parsed.password else "") + "@"
+    netloc = f"{userinfo}{ipv4}"
+    if parsed.port is not None:
+        netloc += f":{parsed.port}"
+    return urlunparse(parsed._replace(netloc=netloc))
 
 AuthMode = Literal["anonymous", "username", "certificate"]
 
@@ -77,7 +113,7 @@ class UaClient(QObject):
         self._subs_ev = {}
 
     def get_endpoints(self, uri: str) -> list[ua.EndpointDescription]:
-        client = Client(uri, timeout=2, tloop=self._tloop)
+        client = Client(_force_ipv4_hostname(uri), timeout=2, tloop=self._tloop)
         edps = client.connect_and_get_server_endpoints()
         for i, ep in enumerate(edps, start=1):
             logger.info('Endpoint %s:', i)
@@ -164,7 +200,7 @@ class UaClient(QObject):
     def connect(self, uri: str) -> None:
         self.disconnect()
         logger.info("Connecting to %s with parameters %s, %s, %s, %s, %s", uri, self.auth_mode, self.security_mode, self.security_policy, self.user_certificate_path, self.user_private_key_path)
-        self.client = Client(uri, tloop=self._tloop)
+        self.client = Client(_force_ipv4_hostname(uri), tloop=self._tloop)
         self.client.application_uri = self.application_uri
         self.client.description = "FreeOpcUa Client GUI"
 
