@@ -1,10 +1,11 @@
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Iterable
 
 from asyncua.sync import Client as SyncClient, sync_wrapper
-from asyncua.client.ua_client import UaClient as _AsyncUaClient
+from asyncua.client.ua_client import UaClient as _AsyncUaClient, UaClientState
 from asyncua.ua import BrowseNextParameters, BrowseParameters, BrowseDescription, BrowseDirection, BrowseResultMask, ObjectIds, NodeClass
 
 from PyQt6.QtCore import (
@@ -467,6 +468,17 @@ class TreeWidget(QObject):
             child = model.index(row, 0, proxy_idx)
             if not child.isValid():
                 continue
+            # Skip rows whose children have not been fetched yet:
+            # ``QTreeView.setExpanded`` on such a row synchronously calls
+            # ``canFetchMore``/``fetchMore`` on the source model, and our
+            # ``fetchMore`` resolves to ``node.get_children_descriptions``
+            # — a blocking OPC-UA round-trip. Firing it from inside the
+            # filter slot stalls the GUI thread for as long as the server
+            # takes to answer. The recursive filter already keeps the
+            # row visible, so the user can expand it manually.
+            source_child = model.mapToSource(child)
+            if self.model.canFetchMore(source_child):
+                continue
             self.view.setExpanded(child, True)
             if model.hasChildren(child):
                 self._expand_visible(child)
@@ -774,6 +786,74 @@ class _ExpandAllWorker(QObject):
         self._queue = deque([root_node])
         self._visited = 0
 
+    def _restore_batch(self, batch: list[SyncNode]) -> None:
+        """Put ``batch`` back at the front of ``_queue`` after a Browse
+        failure that we're going to retry.
+
+        The parents in ``batch`` were popped from ``_queue`` and added
+        to ``_browsed`` before the Browse call; if we leave them in
+        ``_browsed`` the next iteration would skip them as duplicates
+        and we'd silently lose this layer of the tree. Clear their
+        dedup marks and push them back to the front of ``_queue`` in
+        their original left-to-right order. Push back in reverse so
+        a sequence of ``appendleft`` calls leaves the batch in
+        first-pushed-at-the-front order.
+        """
+        for node in batch:
+            self._browsed.discard(node.nodeid.to_string())
+        for node in reversed(batch):
+            self._queue.appendleft(node)
+
+    def _is_disconnected(self) -> bool:
+        """Return True if the asyncua client can't service a Browse
+        right now.
+
+        Read the live ``UaClientState`` rather than catching a
+        specific exception class: any error coming back from a
+        Browse on a disconnecting/reconnecting socket surfaces as
+        some flavour of ``ConnectionError`` / ``OSError`` / socket
+        error, and the exact type varies across asyncua versions and
+        transports. The state machine is the canonical signal and
+        is robust to that churn.
+        """
+        try:
+            state = self._client.aio_obj.uaclient.state
+        except Exception:
+            # If we can't even read the state, treat it as gone.
+            return True
+        return state in (
+            UaClientState.DISCONNECTED,
+            UaClientState.RECONNECTING,
+            UaClientState.CONNECTING,
+            UaClientState.DISCONNECTING,
+        )
+
+    def _await_reconnect(self) -> bool:
+        """Block the worker thread until the client returns to
+        ``CONNECTED``, the user cancels, or the user disconnects.
+
+        The asyncua state listener fires on the asyncua thread; the
+        worker can't easily subscribe to it from here without
+        cross-thread plumbing. Polling at 100 ms is good enough:
+        reconnect latencies are on the order of seconds, and the
+        worker has nothing else to do while it waits.
+
+        Returns True on reconnect, False on cancel (user-driven
+        ``disconnect`` flips ``_cancelled`` via ``cancel_expand``).
+        """
+        while not self._cancelled:
+            try:
+                state = self._client.aio_obj.uaclient.state
+            except Exception:
+                # State went away under us; the next Browse would
+                # just fail again. Bail out so the worker can emit
+                # an error rather than spin forever.
+                return False
+            if state == UaClientState.CONNECTED:
+                return True
+            time.sleep(0.1)
+        return False
+
     def _browse_next_for(self, continuation_point: bytes) -> ua.BrowseResult | None:
         """Follow a single BrowseNext continuation point to completion.
 
@@ -859,10 +939,50 @@ class _ExpandAllWorker(QObject):
                 # ``ReferenceTypeId=HierarchicalReferences`` and
                 # ``Direction=Forward``; we mirror that exactly so the
                 # BFS view matches what the lazy-load view shows.
+                #
+                # Failure handling: the cause matters.
+                #
+                # * Disconnect mid-walk: the auto-reconnect
+                #   supervisor will re-establish the session in the
+                #   background. We don't want to give up just because
+                #   a network blip landed in the middle of the
+                #   expansion. Push the batch back to the front of
+                #   ``_queue`` (and clear its ``_browsed`` marks) so
+                #   the next iteration re-tries the same Browse once
+                #   the link is back up, and poll
+                #   ``UaClientState`` until it returns to CONNECTED
+                #   or the user cancels.
+                # * Any other Browse error (bad request, server
+                #   protocol error, etc.): end the walk. The user
+                #   can inspect the warning and try again.
                 try:
                     results = self._browse_hierarchical(batch)
                 except Exception as ex:
-                    logger.warning("Expand-all batch browse failed: %s", ex)
+                    if self._is_disconnected():
+                        self._restore_batch(batch)
+                        logger.warning(
+                            "Expand-all batch browse failed (%s); "
+                            "pausing until the session is reconnected",
+                            ex,
+                        )
+                        # Update the progress dialog so the user can
+                        # tell the walk is still alive but waiting.
+                        self.progress.emit(
+                            self._visited,
+                            "(paused — waiting for reconnect)",
+                        )
+                        if self._await_reconnect() and not self._cancelled:
+                            # Session back up; the next loop
+                            # iteration re-pops the same batch and
+                            # retries the Browse.
+                            continue
+                        # Cancelled (or reconnect gave up).
+                        self.finished.emit("cancelled")
+                        return
+                    logger.warning(
+                        "Expand-all batch browse failed (%s); ending walk",
+                        ex,
+                    )
                     self.failed.emit(ex)
                     self.finished.emit("error")
                     return

@@ -1,5 +1,6 @@
 import logging
 import socket
+import threading
 from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import urlparse, urlunparse
@@ -90,6 +91,10 @@ class UaClient(QObject):
         self.password: str | None = None
         self.endpoint_url: str | None = None
         self.load_application_certificate_settings()
+        # Background worker for the best-effort custom-type load kicked off
+        # at the end of connect(). Tracked so a second connect() doesn't
+        # spawn a duplicate worker.
+        self._custom_types_thread: threading.Thread | None = None
 
     def shutdown(self) -> None:
         """Tear down the shared ThreadLoop. Call once on application exit."""
@@ -235,13 +240,60 @@ class UaClient(QObject):
         self.client.connect(auto_reconnect=True)
         self._connected = True
         self._install_state_listener()
+        self.save_security_settings(uri)
+        # Defer the custom-type load to a worker so a slow or unresponsive
+        # server can't block the connect path or break the session: the
+        # load walks the type tree with browse requests and a single
+        # hang (common on older firmware that pre-dates the 1.04
+        # DataTypeDefinition attribute) used to surface as a TimeoutError
+        # that left the sync client in a state where the next
+        # read_attributes / browse call raised "Connection is closed".
+        self._schedule_load_custom_types()
+
+    def _schedule_load_custom_types(self) -> None:
+        """Defer the custom-type load to a background worker.
+
+        The load walks the type tree with browse requests and a single
+        hang (common on older firmware that pre-dates the 1.04
+        DataTypeDefinition attribute) used to block the connect path
+        and break the session: the TimeoutError left the sync client
+        in a state where the next read_attributes / browse call raised
+        "Connection is closed" before the auto-reconnect supervisor
+        could finish its handshake. Running the load in a daemon
+        thread keeps the connect path unblocked. The worker is
+        best-effort, failures are logged, and a stuck load cannot
+        block app exit. If the user disconnects while the load is in
+        progress, the pending requests fail with ConnectionError and
+        the worker exits cleanly via the try/except in
+        ``_load_custom_types_worker``.
+        """
+        if self.client is None:
+            return
+        thread = self._custom_types_thread
+        if thread is not None and thread.is_alive():
+            # a previous connect's load is still in progress; let it
+            # finish rather than double up.
+            return
+        self._custom_types_thread = threading.Thread(
+            target=self._load_custom_types_worker,
+            name="load-custom-types",
+            daemon=True,
+        )
+        self._custom_types_thread.start()
+
+    def _load_custom_types_worker(self) -> None:
+        # Capture the client reference; self.client may be reset on
+        # disconnect before this worker gets a chance to run.
+        client = self.client
+        if client is None:
+            return
         try:
-            self.client.load_data_type_definitions()
-            self.client.load_enums()
-            self.client.load_type_definitions()
+            client.load_data_type_definitions()
+            client.load_enums()
+            client.load_type_definitions()
+            logger.info("Custom types loaded")
         except Exception:
             logger.exception("Loading custom types failed (server may pre-date spec 1.04)")
-        self.save_security_settings(uri)
 
     def _install_state_listener(self) -> None:
         """Forward asyncua state transitions to the Qt signal.

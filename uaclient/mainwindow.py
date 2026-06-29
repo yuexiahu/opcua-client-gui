@@ -1,6 +1,7 @@
 import logging
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from typing import Any
 
 from PyQt6.QtCore import (
@@ -738,6 +739,19 @@ def main() -> None:
     logging.getLogger().addHandler(handler)
     logging.getLogger("uaclient").setLevel(logging.INFO)
     logging.getLogger("uawidgets").setLevel(logging.INFO)
+
+    # Mirror logs to a rolling file in the current working directory.
+    # Single file 1 MiB, keep 5 backups (opcua-client.log.1 ... .5).
+    file_handler = RotatingFileHandler(
+        "opcua-client.log",
+        maxBytes=1 << 20,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(name)s - %(levelname)s - %(message)s"
+    ))
+    logging.getLogger().addHandler(file_handler)
 
     if QSettings().value("dark_mode", "false") == "true":
         file = QFile(":/dark.qss")
