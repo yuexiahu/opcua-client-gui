@@ -355,6 +355,17 @@ class Window(QMainWindow):
             "Expand the tree one node at a time (slower, but tolerates "
             "servers that reject batched Browse)"
         )
+        # CSV export of the selected node's subtree. Created here (before
+        # ``setup_context_menu_tree``) so the right-click menu can wire
+        # it in the same call as the other tree actions. ``export_csv``
+        # reads from the source model, so a filtered view doesn't shrink
+        # the output; the user is expected to Expand All first if they
+        # want a complete subtree.
+        self.ui.actionExportCSV = QAction("Export CSV...", self)
+        self.ui.actionExportCSV.setToolTip(
+            "Export the selected node's subtree to a CSV file "
+            "(Path, DisplayName, BrowseName, NodeId, NodeClass)"
+        )
 
         self.setup_context_menu_tree()
         selection_model = self.ui.treeView.selectionModel()
@@ -378,6 +389,7 @@ class Window(QMainWindow):
         self.ui.actionCall.triggered.connect(self.call_method)
         self.ui.actionExpandAll.triggered.connect(self._on_expand_all_fast)
         self.ui.actionExpandAllNormal.triggered.connect(self._on_expand_all_normal)
+        self.ui.actionExportCSV.triggered.connect(self.tree_ui.export_csv)
 
         selection_model.selectionChanged.connect(self.show_attrs)
         self.ui.attrRefreshButton.clicked.connect(self.show_attrs)
@@ -505,6 +517,7 @@ class Window(QMainWindow):
             self.ui.actionCopyNodeId,
             self.ui.actionExpandAll,
             self.ui.actionExpandAllNormal,
+            self.ui.actionExportCSV,
         ):
             action.setEnabled(connected)
         if not connected:
@@ -512,6 +525,8 @@ class Window(QMainWindow):
             # next Method node is selected.
             self.ui.actionCall.setEnabled(False)
             self.ui.actionExpandAll.setEnabled(False)
+            self.ui.actionExpandAllNormal.setEnabled(False)
+            self.ui.actionExportCSV.setEnabled(False)
 
         if state == "reconnecting":
             self.ui.statusBar.show()
@@ -633,6 +648,7 @@ class Window(QMainWindow):
         # reject batched Browse.
         self.addAction(self.ui.actionExpandAll)
         self.addAction(self.ui.actionExpandAllNormal)
+        self.addAction(self.ui.actionExportCSV)
         self._contextMenu.addSeparator()
         self._contextMenu.addAction(self.ui.actionCall)
         self._contextMenu.addSeparator()
@@ -646,6 +662,11 @@ class Window(QMainWindow):
         self.ui.actionCall.setEnabled(False)
         self.ui.actionExpandAll.setEnabled(False)
         self.ui.actionExpandAllNormal.setEnabled(False)
+        # Export CSV is meaningful for any node class, not just
+        # Object/Method, so it gates purely on selection presence.
+        # ``_apply_ui_state`` already flipped it to ``connected`` for
+        # the live-session gate; this refines it per-selection.
+        self.ui.actionExportCSV.setEnabled(node is not None)
         if node:
             if node.read_node_class() == ua.NodeClass.Method:
                 self.ui.actionCall.setEnabled(True)

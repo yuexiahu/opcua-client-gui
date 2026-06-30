@@ -1,8 +1,9 @@
+import csv
 import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
 from asyncua.sync import Client as SyncClient, sync_wrapper
 from asyncua.client.ua_client import UaClient as _AsyncUaClient, UaClientState
@@ -19,9 +20,10 @@ from PyQt6.QtCore import (
     QSettings,
     QSortFilterProxyModel,
     QThread,
+    QAbstractItemModel,
 )
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QIcon, QAction
-from PyQt6.QtWidgets import QApplication, QAbstractItemView, QHeaderView, QLineEdit, QTreeView
+from PyQt6.QtWidgets import QApplication, QAbstractItemView, QFileDialog, QHeaderView, QLineEdit, QTreeView
 
 from asyncua import ua
 from asyncua.sync import SyncNode, new_node
@@ -29,8 +31,12 @@ from asyncua.sync import SyncNode, new_node
 
 logger = logging.getLogger(__name__)
 
-# Bumped to v3: invalidate pre-proxy-model header state that may have left
-# columns at zero width / hidden after wrapping the tree in a proxy.
+# Back to v3: an earlier iteration added a 4th 'Path' column to the
+# model and bumped the key forward; the user wanted the path to be
+# computed at export time instead, so the model is back to 3 columns
+# and the saved header state from v4/v5 (which referenced the extra
+# column) is dropped. The v3 key was the original — restoring it
+# means any pre-v4 install gets the original behaviour back too.
 _HEADER_STATE_KEY = "tree_widget_state_v3"
 
 # Custom role on the column-0 QStandardItem. Set to ``True``/``False``
@@ -38,6 +44,15 @@ _HEADER_STATE_KEY = "tree_widget_state_v3"
 # drawing a (misleading) expand arrow on leaf node types like
 # ``Variable`` or ``Method`` without doing a server round-trip per row.
 _CAN_HAVE_CHILDREN_ROLE = Qt.ItemDataRole.UserRole + 1
+
+# Stores the ua.NodeClass enum int on the column-0 item. NodeClass
+# is not shown in the tree but the CSV export wants it; caching the
+# int here avoids a ``read_node_class`` server round-trip per row
+# during export. The role is set once at insert time and read rarely,
+# so the per-row overhead is small. Drop this role (and re-read
+# NodeClass at export time) if you'd rather the model carry nothing
+# the tree doesn't display.
+_NODE_CLASS_ROLE = Qt.ItemDataRole.UserRole + 2
 
 
 def _node_class_can_have_children(node_class: ua.NodeClass) -> bool:
@@ -177,6 +192,125 @@ class TreeWidget(QObject):
         clipboard = QApplication.clipboard()
         if clipboard is not None:
             clipboard.setText(path_str)
+
+    def export_csv(self) -> None:
+        """Export the current node's subtree to a CSV file.
+
+        Writes one row per node currently in the model under the
+        selected row, in DFS order. Columns: Path, DisplayName,
+        BrowseName, NodeId, NodeClass. The file is opened with a
+        utf-8-sig BOM so Excel imports it cleanly without re-encoding.
+
+        The export covers only what the model already has loaded:
+        rows that haven't been browsed yet are not in the model and
+        will not appear in the CSV. Use Expand All first if a
+        complete subtree is wanted. This deliberately avoids
+        piggy-backing on the expand-all worker — that worker can
+        take a long time on a server with thousands of nodes (and
+        can outright fail on the S7-1500 in Batched mode), and a
+        synchronous "auto-expand before export" call would freeze
+        the GUI on top of that.
+
+        Filter state is intentionally ignored: the proxy model is
+        a browsing aid, the CSV is meant to be a complete dump of
+        the selected subtree.
+        """
+        current = self.view.currentIndex()
+        if not current.isValid():
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self.view,
+            "Export Tree to CSV",
+            "opcua-tree.csv",
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        # Map the proxy index back to the source so the walk covers
+        # the full subtree, not just what the filter happens to
+        # admit. ``sibling(row, 0)`` normalises to the column-0 row
+        # anchor (everything else rides on that).
+        if self.proxy is not None:
+            start = self.proxy.mapToSource(current.sibling(current.row(), 0))
+        else:
+            start = current.sibling(current.row(), 0)
+        try:
+            # utf-8-sig BOM so Excel reads the file as UTF-8 without
+            # the user having to import. ``newline=""`` lets csv.writer
+            # own the line terminator; without it, on Windows Python
+            # would emit \r\r\n between rows.
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    ["Path", "DisplayName", "BrowseName", "NodeId", "NodeClass"]
+                )
+                self._walk_csv_to(start, self.model, writer)
+        except OSError as ex:
+            self.error.emit(ex)
+
+    def _walk_csv_to(
+        self,
+        idx: QModelIndex,
+        model: QAbstractItemModel,
+        writer: Any,
+    ) -> None:
+        """DFS walk writing one CSV row per index.
+
+        Pulls each column's DisplayRole text directly from the
+        source model so the CSV matches what the user sees in the
+        tree. The path is computed on the fly (see ``_path_for``)
+        rather than read from a column — the model carries no Path
+        data by design. NodeClass comes from a role on the
+        column-0 item, since it isn't a visible column either.
+        """
+        if not idx.isValid():
+            return
+        row = idx.row()
+        parent = idx.parent()
+        path = self._path_for(idx)
+        dname = model.data(model.index(row, 0, parent)) or ""
+        bname = model.data(model.index(row, 1, parent)) or ""
+        nodeid = model.data(model.index(row, 2, parent)) or ""
+        node_class_int = model.data(idx, _NODE_CLASS_ROLE)
+        # The role was stored as int; reconstructing the enum lets
+        # us render ``Object`` rather than ``1`` in the CSV without
+        # hard-coding the mapping here.
+        node_class_str = (
+            ua.NodeClass(node_class_int).name
+            if node_class_int is not None
+            else ""
+        )
+        writer.writerow([path, dname, bname, nodeid, node_class_str])
+        for r in range(model.rowCount(idx)):
+            child = model.index(r, 0, idx)
+            if child.isValid():
+                self._walk_csv_to(child, model, writer)
+
+    def _path_for(self, idx: QModelIndex) -> str:
+        """Build the "/"-joined BrowseName path for ``idx``.
+
+        Walks ``idx.parent()`` up to the root, reading each row's
+        column-1 (BrowseName) text. The text is populated by
+        ``TreeViewModel.add_item`` from the ReferenceDescription
+        the server returned at Browse time, so this is a pure
+        in-memory walk with no server round-trips. The result is
+        the same shape the user originally asked for:
+        ``"Root/Objects/Server"``.
+
+        Computing on demand (instead of caching on the model) keeps
+        the model free of fields the tree view doesn't render; the
+        walk is O(depth) per row, which for an OPC-UA tree is
+        typically a handful of levels, and ``_walk_csv_to`` visits
+        each row exactly once.
+        """
+        parts: list[str] = []
+        cur = idx
+        while cur.isValid():
+            bname = self.model.data(cur.sibling(cur.row(), 1)) or ""
+            if bname:
+                parts.append(bname)
+            cur = cur.parent()
+        return "/".join(reversed(parts))
 
     def expand_current_node(self, expand: bool = True) -> None:
         idx = self.view.currentIndex()
@@ -611,6 +745,13 @@ class TreeViewModel(QStandardItemModel):
             _node_class_can_have_children(desc.NodeClass),
             _CAN_HAVE_CHILDREN_ROLE,
         )
+        # Cache the NodeClass int so the CSV export can pick it up
+        # without a ``read_node_class`` server round-trip per row.
+        # Path is *not* cached here — it's computed at export time
+        # by walking the source-model parent chain (see
+        # ``TreeWidget._path_for``), per the user's preference to
+        # keep the model free of fields the tree doesn't render.
+        item[0].setData(int(desc.NodeClass), _NODE_CLASS_ROLE)
         if parent:
             parent.appendRow(item)
         else:
