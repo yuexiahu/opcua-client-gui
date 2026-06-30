@@ -182,9 +182,26 @@ class TreeWidget(QObject):
         idx = self.view.currentIndex()
         self.view.setExpanded(idx, expand)
 
-    def expand_all_async(self, idx: QModelIndex | None = None) -> None:
+    def expand_all_async(
+        self,
+        idx: QModelIndex | None = None,
+        mode: str = "fast",
+    ) -> None:
         """Recursively expand the row at ``idx`` (or the current row) and
         all of its descendants, off the GUI thread.
+
+        ``mode`` is either ``"fast"`` (BFS, up to 50 parents per Browse
+        call) or ``"normal"`` (DFS, one parent per Browse call — the
+        original on-demand semantics, useful as a fallback on servers
+        that reject batched Browse).
+
+        Already-fetched subtrees are skipped: ``TreeViewModel.unexpanded_descendants``
+        walks the model on the GUI thread and returns every node whose
+        children are not yet installed. Those nodes become the worker's
+        starting queue, so a retry after a partial walk (e.g. a
+        ``BadNoContinuationPoints`` failure partway down the tree) only
+        re-browses the boundary between "expanded" and "not yet
+        expanded" rather than starting from the root again.
 
         The OPC-UA I/O for each visited node happens in a QThread worker
         (``_ExpandAllWorker``); the GUI side only installs the resulting
@@ -222,9 +239,28 @@ class TreeWidget(QObject):
         node = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(node, SyncNode):
             return
+        # Pick the worker's starting nodes on the GUI thread. On a
+        # fresh tree this returns ``[node]``; on a retry it returns
+        # the first un-expanded node in every partially-expanded
+        # branch, so the worker only re-browses what's actually
+        # missing. The worker's own ``_browsed`` set still dedups
+        # any overlap between the seed list and what gets discovered
+        # during the walk.
+        start_nodes = self.model.unexpanded_descendants(source_idx)
+        if not start_nodes:
+            # Everything is already expanded. Avoid spinning up a
+            # worker for an empty queue; just notify the caller of
+            # a no-op completion.
+            logger.info(
+                "expand_all_async: nothing to expand under %s; "
+                "skipping worker startup",
+                node.nodeid,
+            )
+            self.expand_completed.emit("ok")
+            return
         # Spin up a fresh worker + thread per call; auto-cleanup on
         # completion. ~10 ms spin-up cost is dwarfed by server RTT.
-        self._worker = _ExpandAllWorker(self._client)
+        self._worker = _ExpandAllWorker(self._client, mode=mode)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -236,7 +272,7 @@ class TreeWidget(QObject):
         self._worker.finished.connect(self._thread.quit)
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
-        self._worker.start(node)
+        self._worker.start(start_nodes)
         self._is_expanding = True
         self._thread.start()
 
@@ -619,6 +655,46 @@ class TreeViewModel(QStandardItemModel):
             return None
         return idx.sibling(idx.row(), 0)
 
+    def unexpanded_descendants(self, root_idx: QModelIndex) -> list[SyncNode]:
+        """Return every node under ``root_idx`` whose children have not
+        been fetched yet.
+
+        Used by :meth:`TreeWidget.expand_all_async` to seed the worker
+        queue for a retry. The walk goes left-to-right, depth-first;
+        when it hits a node that the model already considers fetched
+        (i.e. its children are installed), it recurses into those
+        children. When it hits an un-fetched node, it records the
+        node and stops — we cannot know the node's children without
+        a server round-trip, so any descendants are unreachable until
+        the worker browses it. The returned list is the worker's
+        starting queue: every entry is a parent whose Browse is
+        required to make further progress.
+
+        On a freshly-loaded tree (root not yet expanded), this
+        returns ``[root]``; on a tree where the previous walk
+        succeeded, it returns ``[]``.
+        """
+        result: list[SyncNode] = []
+
+        def walk(idx: QModelIndex) -> None:
+            item = self.itemFromIndex(idx)
+            if item is None:
+                return
+            node = item.data(Qt.ItemDataRole.UserRole)
+            if node is None:
+                return
+            if node not in self._fetched:
+                result.append(node)
+                return
+            for row in range(item.rowCount()):
+                # ``QModelIndex.child`` is PyQt5-only; in PyQt6 the
+                # canonical way to build a child index is
+                # ``QAbstractItemModel.index(row, column, parent)``.
+                walk(self.index(row, 0, idx))
+
+        walk(root_idx)
+        return result
+
     def reset_cache(self, node: SyncNode) -> None:
         if node in self._fetched:
             self._fetched.remove(node)
@@ -746,8 +822,10 @@ class _ExpandAllWorker(QObject):
     finished = pyqtSignal(str)  # "ok" | "cancelled" | "error"
     failed = pyqtSignal(object)  # Exception
 
-    def __init__(self, client: SyncClient) -> None:
+    def __init__(self, client: SyncClient, mode: str = "fast") -> None:
         super().__init__()
+        if mode not in ("fast", "normal"):
+            raise ValueError(f"Unknown expand-all mode: {mode!r}")
         self._client = client
         # ``_sync_browse`` is the synchronous wrapper around the
         # async ``UaClient.browse`` coroutine, bound to the same
@@ -771,6 +849,15 @@ class _ExpandAllWorker(QObject):
         self._browsed: set[str] = set()  # NodeId.to_string() values
         self._queue: deque[SyncNode] = deque()
         self._visited: int = 0
+        # "fast" batches up to ``BATCH_SIZE`` parents per Browse call
+        # and walks the tree in BFS order (level by level). "normal"
+        # browses one parent at a time in DFS order, replicating the
+        # semantics of the original on-demand ``fetchMore`` walk that
+        # the GUI used before the BFS batch worker landed; the
+        # trade-off is many more round-trips for big trees, but some
+        # servers (S7-1500 with shallow ContinuationPoint pools) only
+        # tolerate the unbatched form.
+        self._mode: str = mode
 
     @pyqtSlot()
     def cancel(self) -> None:
@@ -779,30 +866,73 @@ class _ExpandAllWorker(QObject):
         # callback in uaclient/uaclient.py.
         self._cancelled = True
 
-    def start(self, root_node: SyncNode) -> None:
-        """Reset state for a fresh expand-all rooted at ``root_node``."""
+    def start(self, start_nodes: list[SyncNode]) -> None:
+        """Reset state for a fresh expand-all rooted at ``start_nodes``.
+
+        A single-node list corresponds to the "expand everything from
+        here" case; multiple nodes are used for a retry that should
+        skip the already-browsed ancestors (see
+        :meth:`TreeViewModel.unexpanded_descendants` and
+        :meth:`TreeWidget.expand_all_async`).
+        """
         self._cancelled = False
         self._browsed = set()
-        self._queue = deque([root_node])
+        self._queue = deque(start_nodes)
         self._visited = 0
 
+    def _pop_next(self) -> SyncNode:
+        """Pop the next parent to browse.
+
+        ``normal`` (DFS) mode pops from the right end of the deque
+        (LIFO) so the walk goes depth-first and matches the original
+        on-demand ``QTreeView.expandAll`` semantics. ``fast`` (BFS)
+        mode pops from the left end (FIFO) for level-by-level
+        expansion.
+        """
+        if self._mode == "normal":
+            return self._queue.pop()
+        return self._queue.popleft()
+
+    def _push_children(
+        self, parent: SyncNode, deduped: list[ua.ReferenceDescription]
+    ) -> None:
+        """Queue the children of ``parent`` for later browsing.
+
+        In ``normal`` (DFS) mode children are pushed in reverse so
+        the leftmost sibling is popped first, matching left-to-right
+        depth-first order. In ``fast`` (BFS) mode children are pushed
+        in source order so the queue is processed level by level.
+        """
+        if self._mode == "normal":
+            for d in reversed(deduped):
+                self._queue.append(new_node(parent, d.NodeId))
+            return
+        for d in deduped:
+            self._queue.append(new_node(parent, d.NodeId))
+
     def _restore_batch(self, batch: list[SyncNode]) -> None:
-        """Put ``batch`` back at the front of ``_queue`` after a Browse
-        failure that we're going to retry.
+        """Put ``batch`` back on ``_queue`` after a Browse failure that
+        we're going to retry.
 
         The parents in ``batch`` were popped from ``_queue`` and added
         to ``_browsed`` before the Browse call; if we leave them in
         ``_browsed`` the next iteration would skip them as duplicates
         and we'd silently lose this layer of the tree. Clear their
-        dedup marks and push them back to the front of ``_queue`` in
-        their original left-to-right order. Push back in reverse so
-        a sequence of ``appendleft`` calls leaves the batch in
-        first-pushed-at-the-front order.
+        dedup marks and push them back on ``_queue`` in their original
+        left-to-right order. Push back in reverse so a sequence of
+        ``append``/``appendleft`` calls leaves the batch in
+        first-pushed-at-the-front order. ``DFS`` mode puts them back
+        on the top of the stack (the right end) so the next iteration
+        pops them in the same order; ``BFS`` puts them on the left
+        end so the next iteration pops them in the same order.
         """
         for node in batch:
             self._browsed.discard(node.nodeid.to_string())
+        push = (
+            self._queue.append if self._mode == "normal" else self._queue.appendleft
+        )
         for node in reversed(batch):
-            self._queue.appendleft(node)
+            push(node)
 
     def _is_disconnected(self) -> bool:
         """Return True if the asyncua client can't service a Browse
@@ -914,11 +1044,16 @@ class _ExpandAllWorker(QObject):
                     self.finished.emit("cancelled")
                     return
 
-                # Pop up to BATCH_SIZE parents from the front of the
-                # deque, skipping any NodeId we've already walked.
+                # Pop up to BATCH_SIZE parents from ``_queue``, skipping
+                # any NodeId we've already walked. In ``fast`` (BFS) mode
+                # the batch can contain up to BATCH_SIZE parents because
+                # they all share a single Browse call; in ``normal`` (DFS)
+                # mode we go one parent at a time, matching the original
+                # unbatched semantics.
                 batch: list[SyncNode] = []
-                while self._queue and len(batch) < self.BATCH_SIZE:
-                    node = self._queue.popleft()
+                batch_size = 1 if self._mode == "normal" else self.BATCH_SIZE
+                while self._queue and len(batch) < batch_size:
+                    node = self._pop_next()
                     node_key = node.nodeid.to_string()
                     if node_key in self._browsed:
                         continue
@@ -958,12 +1093,29 @@ class _ExpandAllWorker(QObject):
                 try:
                     results = self._browse_hierarchical(batch)
                 except Exception as ex:
+                    # Log the NodeIds of every parent in the failed batch
+                    # so the operator can correlate this with a specific
+                    # subtree. Some servers (notably the Siemens S7-1500
+                    # line) reject the entire batch with
+                    # BadNoContinuationPoints when one of the parents
+                    # would otherwise consume the last free continuation
+                    # point — the per-node StatusCode from
+                    # ``_browse_hierarchical`` would have shown
+                    # "skipping" for the offending node, but on those
+                    # servers we never get that far because the batch
+                    # itself is rejected with "Unhandled exception"
+                    # before any per-node results come back. Including
+                    # the parent list here is the only signal that lets
+                    # us narrow the failure down to a specific subtree.
+                    parents_repr = ", ".join(
+                        n.nodeid.to_string() for n in batch
+                    )
                     if self._is_disconnected():
                         self._restore_batch(batch)
                         logger.warning(
-                            "Expand-all batch browse failed (%s); "
-                            "pausing until the session is reconnected",
-                            ex,
+                            "Expand-all batch browse failed (%s) on batch "
+                            "[%s]; pausing until the session is reconnected",
+                            ex, parents_repr,
                         )
                         # Update the progress dialog so the user can
                         # tell the walk is still alive but waiting.
@@ -980,8 +1132,9 @@ class _ExpandAllWorker(QObject):
                         self.finished.emit("cancelled")
                         return
                     logger.warning(
-                        "Expand-all batch browse failed (%s); ending walk",
-                        ex,
+                        "Expand-all batch browse failed (%s) on batch "
+                        "[%s]; ending walk",
+                        ex, parents_repr,
                     )
                     self.failed.emit(ex)
                     self.finished.emit("error")
@@ -990,9 +1143,19 @@ class _ExpandAllWorker(QObject):
                 groups: list[tuple[SyncNode, list[ua.ReferenceDescription]]] = []
                 for parent, br in results:
                     if not br.StatusCode.is_good():
+                        # Surface the symbolic name + spec doc string alongside
+                        # the raw StatusCode value: BadNoContinuationPoints
+                        # (the typical S7-1500 symptom) reads as a generic
+                        # 0x804B0000 otherwise and gives no hint that the
+                        # server has run out of continuation points. Without
+                        # this the user sees "skipping" with no actionable
+                        # detail; with it they immediately recognise a
+                        # server-side resource issue and can release CPs by
+                        # reconnecting / giving the server time to GC.
+                        sc = br.StatusCode
                         logger.warning(
-                            "Browse for %s returned %s; skipping",
-                            parent.nodeid, br.StatusCode,
+                            "Browse for %s returned %s (%s: %s); skipping",
+                            parent.nodeid, sc, sc.name, sc.doc,
                         )
                         continue
                     descs = list(br.References)
@@ -1025,8 +1188,7 @@ class _ExpandAllWorker(QObject):
                         seen.add(d.NodeId)
                         deduped.append(d)
                     groups.append((parent, deduped))
-                    for d in deduped:
-                        self._queue.append(new_node(parent, d.NodeId))
+                    self._push_children(parent, deduped)
 
                 if self._cancelled:
                     self.finished.emit("cancelled")

@@ -337,6 +337,25 @@ class Window(QMainWindow):
             ],
         )
         self.tree_ui.error.connect(self.show_error)
+
+        # Expand-All has two modes: the BFS-batched "fast" path
+        # (existing QAction from the .ui file) and the unbatched
+        # one-parent-per-Browse "normal" path. The latter is the
+        # fallback for servers (S7-1500) that reject batched Browse
+        # with BadNoContinuationPoints. Create the new QAction here
+        # (before ``setup_context_menu_tree``) so the right-click
+        # menu can wire it in the same call. We rename the original
+        # action at runtime so the toolbar/menu and the right-click
+        # menu both read consistently; the underlying QAction is
+        # still the same object so any shortcuts / icon set in the
+        # .ui file are preserved.
+        self.ui.actionExpandAll.setText("Expand All (Fast)")
+        self.ui.actionExpandAllNormal = QAction("Expand All (Normal)", self)
+        self.ui.actionExpandAllNormal.setToolTip(
+            "Expand the tree one node at a time (slower, but tolerates "
+            "servers that reject batched Browse)"
+        )
+
         self.setup_context_menu_tree()
         selection_model = self.ui.treeView.selectionModel()
         assert selection_model is not None
@@ -357,7 +376,8 @@ class Window(QMainWindow):
         self.ui.actionCopyPath.triggered.connect(self.tree_ui.copy_path)
         self.ui.actionCopyNodeId.triggered.connect(self.tree_ui.copy_nodeid)
         self.ui.actionCall.triggered.connect(self.call_method)
-        self.ui.actionExpandAll.triggered.connect(self._on_expand_all)
+        self.ui.actionExpandAll.triggered.connect(self._on_expand_all_fast)
+        self.ui.actionExpandAllNormal.triggered.connect(self._on_expand_all_normal)
 
         selection_model.selectionChanged.connect(self.show_attrs)
         self.ui.attrRefreshButton.clicked.connect(self.show_attrs)
@@ -484,6 +504,7 @@ class Window(QMainWindow):
             self.ui.actionCopyPath,
             self.ui.actionCopyNodeId,
             self.ui.actionExpandAll,
+            self.ui.actionExpandAllNormal,
         ):
             action.setEnabled(connected)
         if not connected:
@@ -606,7 +627,12 @@ class Window(QMainWindow):
         self._contextMenu = QMenu()
         self.addAction(self.ui.actionCopyPath)
         self.addAction(self.ui.actionCopyNodeId)
+        # Two expand-all entries: (Fast) batches up to 50 parents per
+        # Browse call; (Normal) browses one parent at a time, matching
+        # the original on-demand semantics and surviving servers that
+        # reject batched Browse.
         self.addAction(self.ui.actionExpandAll)
+        self.addAction(self.ui.actionExpandAllNormal)
         self._contextMenu.addSeparator()
         self._contextMenu.addAction(self.ui.actionCall)
         self._contextMenu.addSeparator()
@@ -619,28 +645,42 @@ class Window(QMainWindow):
         node = self.get_current_node(current)
         self.ui.actionCall.setEnabled(False)
         self.ui.actionExpandAll.setEnabled(False)
+        self.ui.actionExpandAllNormal.setEnabled(False)
         if node:
             if node.read_node_class() == ua.NodeClass.Method:
                 self.ui.actionCall.setEnabled(True)
             if node.read_node_class() == ua.NodeClass.Object:
                 self.ui.actionExpandAll.setEnabled(True)
+                self.ui.actionExpandAllNormal.setEnabled(True)
 
     def _refresh_expand_all_action(self) -> None:
-        """Re-enable the Expand-All action iff the current node is still
+        """Re-enable the Expand-All actions iff the current node is still
         an Object (mirrors the gate in :meth:`_update_actions_state`).
         """
         node = self.get_current_node()
         enabled = node is not None and node.read_node_class() == ua.NodeClass.Object
         self.ui.actionExpandAll.setEnabled(enabled)
+        self.ui.actionExpandAllNormal.setEnabled(enabled)
 
     @trycatchslot
-    def _on_expand_all(self) -> None:
+    def _on_expand_all_fast(self) -> None:
+        self._on_expand_all(mode="fast")
+
+    @trycatchslot
+    def _on_expand_all_normal(self) -> None:
+        self._on_expand_all(mode="normal")
+
+    def _on_expand_all(self, mode: str) -> None:
         if self.tree_ui.is_expanding():
             return
         node = self.get_current_node()
         if not node or node.read_node_class() != ua.NodeClass.Object:
             return
+        # Disable both Expand-All entries; only the one that triggered
+        # the run is the "primary", but disabling both keeps the UI
+        # from being ambiguous about which is in flight.
         self.ui.actionExpandAll.setEnabled(False)
+        self.ui.actionExpandAllNormal.setEnabled(False)
         # Close any leftover dialog from a previous Expand-All run
         # before creating a new one; otherwise it would stay on screen
         # with a stale label.
@@ -648,7 +688,7 @@ class Window(QMainWindow):
         self._expand_progress_dialog = None
         if stale is not None:
             stale.reject()
-        dialog = self._show_expand_progress()
+        dialog = self._show_expand_progress(mode)
         self._expand_progress_dialog = dialog
         # Wire signals before starting the worker, otherwise the first
         # batch can land in the event queue *before* the connections are
@@ -665,14 +705,16 @@ class Window(QMainWindow):
         # Start the worker directly. The Browse call is on a separate
         # thread, so the GUI thread stays free to run the dialog's
         # event loop.
-        self.tree_ui.expand_all_async()
+        self.tree_ui.expand_all_async(mode=mode)
 
-    def _show_expand_progress(self) -> QProgressDialog:
+    def _show_expand_progress(self, mode: str = "fast") -> QProgressDialog:
         # Indeterminate: the total node count is unknown, and a guessed
         # total that the bar outruns looks worse than a busy indicator.
         dialog = QProgressDialog("Expanding tree…\n0 nodes", "Cancel", 0, 0, self)
         dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
-        dialog.setWindowTitle("Expand All")
+        dialog.setWindowTitle(
+            "Expand All (Normal)" if mode == "normal" else "Expand All (Fast)"
+        )
         # ``setMinimumDuration`` is a no-op with setRange(0, 0) and no
         # subsequent setValue() — the dialog only shows once the value
         # *changes*, which here would only happen on the first progress
