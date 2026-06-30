@@ -933,10 +933,17 @@ class _ExpandAllWorker(QObject):
     signals. The GUI thread turns each ``fetch_requested`` into model
     rows and ``setExpanded`` calls.
 
-    Iterative BFS over a deque. Each round pops up to ``BATCH_SIZE``
+    Iterative BFS over a deque. Each round pops up to ``_batch_size``
     parents and submits them to ``Client.browse_nodes`` in a single
     Browse service call (the "batch interface" the optimisation was
-    after). Children are then appended to the back of the deque; the
+    after). The batch size starts at ``INITIAL_BATCH`` (one parent
+    per Browse) and is grown adaptively: doubled on every clean
+    success up to ``MAX_BATCH``, and reset to the size that actually
+    worked when a Browse forces an in-iteration halving. A
+    reconnect (the auto-reconnect supervisor re-establishing the
+    session mid-walk) resets the size to ``INITIAL_BATCH`` as well,
+    since the new session may have a different continuation-point
+    pool. Children are then appended to the back of the deque; the
     loop ends when the deque is empty. NodeId-keyed dedup is shared
     with the previous DFS implementation: ``new_node`` builds a fresh
     wrapper every time, so the same logical node can appear under
@@ -956,7 +963,20 @@ class _ExpandAllWorker(QObject):
     count exceeds the server's per-page cap.
     """
 
-    BATCH_SIZE = 50
+    INITIAL_BATCH = 1
+    MAX_BATCH = 16
+    # When the batch has been reduced to a single parent (always the
+    # case for ``normal`` mode, or after a fast-mode batch was halved
+    # all the way down), retry the same Browse request up to this many
+    # times before skipping the parent. Transient errors (server CPU
+    # spikes, brief network blips not flagged by the
+    # ``UaClientState`` disconnect check) often resolve on the next
+    # attempt; persisting errors are skipped with a warning log so the
+    # walk can carry on. Matches the existing per-node BadStatusCode
+    # "skipping" behaviour, which also logs and continues without
+    # surfacing to the GUI.
+    MAX_SINGLE_RETRIES = 3
+    SINGLE_RETRY_DELAY = 0.2  # seconds between single-parent retries
 
     fetch_requested = pyqtSignal(object)  # _FetchBatch
     progress = pyqtSignal(int, str)  # (visited_count, current_path)
@@ -990,15 +1010,21 @@ class _ExpandAllWorker(QObject):
         self._browsed: set[str] = set()  # NodeId.to_string() values
         self._queue: deque[SyncNode] = deque()
         self._visited: int = 0
-        # "fast" batches up to ``BATCH_SIZE`` parents per Browse call
-        # and walks the tree in BFS order (level by level). "normal"
-        # browses one parent at a time in DFS order, replicating the
-        # semantics of the original on-demand ``fetchMore`` walk that
-        # the GUI used before the BFS batch worker landed; the
-        # trade-off is many more round-trips for big trees, but some
-        # servers (S7-1500 with shallow ContinuationPoint pools) only
-        # tolerate the unbatched form.
+        # "fast" walks the tree in BFS order with an adaptive batch
+        # size: starts at ``INITIAL_BATCH`` (one parent per Browse),
+        # doubles on every successful outer iteration up to
+        # ``MAX_BATCH``, and is reduced on Browse failures (see
+        # ``run``). "normal" browses one parent at a time in DFS
+        # order, replicating the semantics of the original on-demand
+        # ``fetchMore`` walk that the GUI used before the BFS batch
+        # worker landed; some servers (S7-1500 with shallow
+        # ContinuationPoint pools) only tolerate the unbatched form.
         self._mode: str = mode
+        # Current batch size for the next outer iteration in ``fast``
+        # mode. Reset to ``INITIAL_BATCH`` on ``start()`` and on a
+        # reconnect; grows on clean success, shrinks when a Browse
+        # forces an in-iteration halving. Unused in ``normal`` mode.
+        self._batch_size: int = self.INITIAL_BATCH
 
     @pyqtSlot()
     def cancel(self) -> None:
@@ -1020,6 +1046,10 @@ class _ExpandAllWorker(QObject):
         self._browsed = set()
         self._queue = deque(start_nodes)
         self._visited = 0
+        # Reset adaptive batch size: we have no information about how
+        # big a Browse this server will tolerate until we have tried
+        # one, so the first iteration starts at the safe minimum.
+        self._batch_size = self.INITIAL_BATCH
 
     def _pop_next(self) -> SyncNode:
         """Pop the next parent to browse.
@@ -1185,23 +1215,44 @@ class _ExpandAllWorker(QObject):
                     self.finished.emit("cancelled")
                     return
 
-                # Pop up to BATCH_SIZE parents from ``_queue``, skipping
-                # any NodeId we've already walked. In ``fast`` (BFS) mode
-                # the batch can contain up to BATCH_SIZE parents because
-                # they all share a single Browse call; in ``normal`` (DFS)
-                # mode we go one parent at a time, matching the original
-                # unbatched semantics.
+                # Pop up to the current batch size from ``_queue``, skipping any
+                # NodeId we've already walked. In ``fast`` (BFS) mode the
+                # batch grows adaptively from 1 up to ``MAX_BATCH`` based
+                # on how the server tolerates Browse requests; in
+                # ``normal`` (DFS) mode we always go one parent at a
+                # time, matching the original unbatched semantics.
                 batch: list[SyncNode] = []
-                batch_size = 1 if self._mode == "normal" else self.BATCH_SIZE
-                while self._queue and len(batch) < batch_size:
+                target_batch = 1 if self._mode == "normal" else self._batch_size
+                while self._queue and len(batch) < target_batch:
                     node = self._pop_next()
                     node_key = node.nodeid.to_string()
                     if node_key in self._browsed:
                         continue
                     self._browsed.add(node_key)
                     batch.append(node)
+                # Credit ``_visited`` at pop time rather than after a
+                # successful Browse, so the progress dialog shows a
+                # monotonically growing count whose per-iteration
+                # increment is the current ``_batch_size`` (predictable
+                # for the user) rather than the post-halving remainder
+                # (which can vary 1…16 round-to-round when the inner
+                # retry path halves the batch). Deferred halves get
+                # re-popped and re-counted on a later iteration; the
+                # total Browse work done is unchanged, the displayed
+                # number is just a touch higher than the unique-node
+                # count. This matches what the user asked for: a
+                # running total that goes up steadily and never resets
+                # mid-walk.
+                self._visited += len(batch)
                 if not batch:
                     continue
+                # Snapshot the size we actually tried; the inner retry
+                # loop may shrink ``batch`` by half (and push the rest
+                # back to the queue), and we need to know whether the
+                # final ``Browse`` succeeded at the original size or
+                # only after halving in order to update ``_batch_size``
+                # appropriately below.
+                initial_batch_size = len(batch)
 
                 # One Browse service call covering every parent in the
                 # batch. We can't use ``Client.browse_nodes`` here
@@ -1228,58 +1279,162 @@ class _ExpandAllWorker(QObject):
                 #   the link is back up, and poll
                 #   ``UaClientState`` until it returns to CONNECTED
                 #   or the user cancels.
-                # * Any other Browse error (bad request, server
-                #   protocol error, etc.): end the walk. The user
-                #   can inspect the warning and try again.
-                try:
-                    results = self._browse_hierarchical(batch)
-                except Exception as ex:
-                    # Log the NodeIds of every parent in the failed batch
-                    # so the operator can correlate this with a specific
-                    # subtree. Some servers (notably the Siemens S7-1500
-                    # line) reject the entire batch with
-                    # BadNoContinuationPoints when one of the parents
-                    # would otherwise consume the last free continuation
-                    # point — the per-node StatusCode from
-                    # ``_browse_hierarchical`` would have shown
-                    # "skipping" for the offending node, but on those
-                    # servers we never get that far because the batch
-                    # itself is rejected with "Unhandled exception"
-                    # before any per-node results come back. Including
-                    # the parent list here is the only signal that lets
-                    # us narrow the failure down to a specific subtree.
-                    parents_repr = ", ".join(
-                        n.nodeid.to_string() for n in batch
-                    )
-                    if self._is_disconnected():
-                        self._restore_batch(batch)
-                        logger.warning(
-                            "Expand-all batch browse failed (%s) on batch "
-                            "[%s]; pausing until the session is reconnected",
-                            ex, parents_repr,
+                # * Any other Browse error: try halving the batch and
+                #   retrying. Some servers (notably the Siemens
+                #   S7-1500 line) reject the entire batch with
+                #   BadNoContinuationPoints when the request would
+                #   otherwise exhaust the server's continuation-point
+                #   pool; the per-node StatusCode from
+                #   ``_browse_hierarchical`` would have shown
+                #   "skipping" for the offending node, but on those
+                #   servers we never get that far because the batch
+                #   itself is rejected with "Unhandled exception"
+                #   before any per-node results come back. Halving
+                #   lets the walk proceed at a batch size the server
+                #   actually accepts; the deferred half is pushed
+                #   back to the front of the queue so it gets retried
+                #   in its own outer-loop iteration. If halving all
+                #   the way down to a single parent still fails,
+                #   retry the same parent a few times to ride out
+                #   transient errors, then skip it and let the walk
+                #   carry on. The skip behaviour matches the existing
+                #   per-node BadStatusCode "skipping" branch, which
+                #   also logs and continues without surfacing to the
+                #   GUI.
+                reconnect_retry = False
+                single_retry = 0
+                while True:
+                    try:
+                        results = self._browse_hierarchical(batch)
+                        break
+                    except Exception as ex:
+                        # Log the NodeIds of every parent in the failed
+                        # batch so the operator can correlate this with
+                        # a specific subtree. Including the parent list
+                        # is the only signal that lets us narrow the
+                        # failure down to a specific subtree.
+                        parents_repr = ", ".join(
+                            n.nodeid.to_string() for n in batch
                         )
-                        # Update the progress dialog so the user can
-                        # tell the walk is still alive but waiting.
+                        if self._is_disconnected():
+                            self._restore_batch(batch)
+                            # Reset adaptive batch size: after a
+                            # reconnect the new session may have a
+                            # different (usually smaller) continuation-
+                            # point pool than the old one, so we want
+                            # to rediscover the right size from
+                            # scratch rather than resume at whatever
+                            # value the old session tolerated.
+                            self._batch_size = self.INITIAL_BATCH
+                            logger.warning(
+                                "Expand-all batch browse failed (%s) on batch "
+                                "[%s]; pausing until the session is reconnected",
+                                ex, parents_repr,
+                            )
+                            # Update the progress dialog so the user can
+                            # tell the walk is still alive but waiting.
+                            self.progress.emit(
+                                self._visited,
+                                "(paused — waiting for reconnect)",
+                            )
+                            if self._await_reconnect() and not self._cancelled:
+                                # Session back up; the next outer-loop
+                                # iteration re-pops the same batch and
+                                # retries the Browse.
+                                reconnect_retry = True
+                                break
+                            # Cancelled (or reconnect gave up).
+                            self.finished.emit("cancelled")
+                            return
+                        if len(batch) <= 1:
+                            # Can't halve further. In ``normal`` mode
+                            # this branch is the only failure path;
+                            # in ``fast`` mode it's the terminal case
+                            # after the batch was halved down to a
+                            # single parent. Retry the same parent a
+                            # few times to ride out transient errors;
+                            # if still failing, skip it and let the
+                            # outer loop carry on with the next node.
+                            if single_retry < self.MAX_SINGLE_RETRIES:
+                                single_retry += 1
+                                logger.info(
+                                    "Browse for %s failed (%s); "
+                                    "retrying (%d/%d)",
+                                    parents_repr, ex,
+                                    single_retry, self.MAX_SINGLE_RETRIES,
+                                )
+                                self.progress.emit(
+                                    self._visited,
+                                    f"(retrying {single_retry}/"
+                                    f"{self.MAX_SINGLE_RETRIES}: "
+                                    f"{parents_repr})",
+                                )
+                                time.sleep(self.SINGLE_RETRY_DELAY)
+                                if self._cancelled:
+                                    self.finished.emit("cancelled")
+                                    return
+                                # Loop back and retry the same parent.
+                                continue
+                            logger.warning(
+                                "Expand-all browse failed (%s) on %s after "
+                                "%d retries; skipping and continuing the walk",
+                                ex, parents_repr, self.MAX_SINGLE_RETRIES,
+                            )
+                            # Empty results so the result-processing
+                            # block below installs no children for
+                            # this parent but still increments
+                            # ``_visited`` and emits a progress tick.
+                            results = []
+                            break
+                        mid = len(batch) // 2
+                        second_half = batch[mid:]
+                        batch = batch[:mid]
+                        # Clear ``_browsed`` marks on the deferred
+                        # half so they get re-popped in their own
+                        # outer-loop iteration; without this, the
+                        # dedup guard in the outer loop would silently
+                        # drop them on the next pop.
+                        for n in second_half:
+                            self._browsed.discard(n.nodeid.to_string())
+                        # BFS pops from the left, so push the deferred
+                        # half back to the left in reverse to preserve
+                        # the original pop order. (DFS mode uses
+                        # ``batch_size=1``, so this branch never runs
+                        # there.)
+                        for n in reversed(second_half):
+                            self._queue.appendleft(n)
+                        if self._cancelled:
+                            self.finished.emit("cancelled")
+                            return
+                        logger.info(
+                            "Browse failed with %d parents; halving batch "
+                            "and retrying with %d (deferred %d to next round)",
+                            len(batch) + len(second_half),
+                            len(batch),
+                            len(second_half),
+                        )
                         self.progress.emit(
                             self._visited,
-                            "(paused — waiting for reconnect)",
+                            f"(halving adaptive batch: retrying with {len(batch)} parents)",
                         )
-                        if self._await_reconnect() and not self._cancelled:
-                            # Session back up; the next loop
-                            # iteration re-pops the same batch and
-                            # retries the Browse.
-                            continue
-                        # Cancelled (or reconnect gave up).
-                        self.finished.emit("cancelled")
-                        return
-                    logger.warning(
-                        "Expand-all batch browse failed (%s) on batch "
-                        "[%s]; ending walk",
-                        ex, parents_repr,
+                        # Loop back and retry with the now-smaller batch.
+                if reconnect_retry:
+                    continue
+
+                # Adaptive batch sizing for the next outer iteration.
+                # A clean success (no halving) doubles ``_batch_size``
+                # up to ``MAX_BATCH``; a success that only landed
+                # after halving keeps ``_batch_size`` at the size that
+                # actually worked, so we don't immediately retry the
+                # size the server just rejected. The reconnect path
+                # already resets ``_batch_size`` to ``INITIAL_BATCH``
+                # before the await, so it doesn't reach here.
+                if len(batch) < initial_batch_size:
+                    self._batch_size = len(batch)
+                else:
+                    self._batch_size = min(
+                        self._batch_size * 2, self.MAX_BATCH
                     )
-                    self.failed.emit(ex)
-                    self.finished.emit("error")
-                    return
 
                 groups: list[tuple[SyncNode, list[ua.ReferenceDescription]]] = []
                 for parent, br in results:
@@ -1341,7 +1496,11 @@ class _ExpandAllWorker(QObject):
                 self.fetch_requested.emit(
                     _FetchBatch(groups=groups, current_path=current_path)
                 )
-                self._visited += len(batch)
+                # ``_visited`` was credited at pop time so the dialog
+                # count grows monotonically with the current
+                # ``_batch_size`` (see the pop block above); only
+                # re-emit progress here so the latest ``current_path``
+                # gets displayed.
                 self.progress.emit(self._visited, current_path)
             self.finished.emit("ok")
         except Exception as ex:
