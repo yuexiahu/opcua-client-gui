@@ -760,6 +760,11 @@ class Window(QMainWindow):
     def _on_expand_completed(self, status: str) -> None:
         dialog = self._expand_progress_dialog
         self._expand_progress_dialog = None
+        # Pull the walk totals before any return path so a future
+        # ``expand_all_async`` (which resets it to None) can't clobber
+        # the values we're about to consume.
+        summary = self.tree_ui._last_summary
+        self.tree_ui._last_summary = None
         if dialog is not None:
             if status == "cancelled":
                 dialog.setLabelText("Cancelled")
@@ -768,6 +773,24 @@ class Window(QMainWindow):
                 dialog.reject()
             else:
                 dialog.accept()
+        # A clean walk that silently dropped parents (per-node
+        # StatusCode-bad or retries-exhausted in the worker) still
+        # ends with status="ok" — without this branch the dialog
+        # would close and the user would only see a WARNING in the
+        # log. Surface it so the gap between "expanded" and
+        # "fully expanded" is visible.
+        if status == "ok" and summary is not None:
+            visited, skipped = summary
+            if skipped > 0:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Warning)
+                box.setText(
+                    f"Expansion completed, but {skipped} of {visited} "
+                    f"nodes were skipped because the server returned an "
+                    f"error for those Browse requests."
+                )
+                box.setInformativeText("See opcua-client.log for details.")
+                box.exec()
         self._refresh_expand_all_action()
 
     def _show_context_menu_tree(self, position: QPoint) -> None:

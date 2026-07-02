@@ -160,6 +160,14 @@ class TreeWidget(QObject):
         self._worker: _ExpandAllWorker | None = None
         self._thread: QThread | None = None
         self._is_expanding: bool = False
+        # Final (visited, skipped) counts from the most recent worker
+        # run. Populated by ``_on_worker_summary`` from the worker's
+        # ``summary`` signal, consumed by ``Window._on_expand_completed``
+        # to surface a warning when a "successful" walk silently
+        # skipped parts of the tree. Reset on every ``expand_all_async``
+        # so a missing summary unambiguously means "no run yet", not
+        # "ran and skipped 0".
+        self._last_summary: tuple[int, int] | None = None
 
     def save_state(self) -> None:
         header = self.view.header()
@@ -349,6 +357,14 @@ class TreeWidget(QObject):
         """
         if self._is_expanding:
             return
+        # Drop any summary left over from the previous run. Reset
+        # unconditionally on entry (not just before worker startup)
+        # so an early-return path like "no client bound" or "nothing
+        # to expand" leaves ``_last_summary`` as ``None``; that way
+        # ``_on_expand_completed`` can treat "summary missing" as
+        # "no walk totals reported" rather than reading a stale
+        # ``(visited, 0)`` from a prior clean run.
+        self._last_summary = None
         if self._client is None:
             # BFS batch worker needs the sync ``Client``; if Window
             # forgot to call ``set_client`` after connect, we silently
@@ -400,6 +416,7 @@ class TreeWidget(QObject):
         self._thread.started.connect(self._worker.run)
         self._worker.fetch_requested.connect(self._on_fetch_requested, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
         self._worker.progress.connect(self.expand_progress, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
+        self._worker.summary.connect(self._on_worker_summary, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
         self._worker.finished.connect(self._on_worker_finished, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
         self._worker.failed.connect(self._on_worker_failed, type=Qt.ConnectionType.QueuedConnection)  # type: ignore[call-arg]
         # Tear-down chain: finished → stop thread; thread done → free.
@@ -467,6 +484,15 @@ class TreeWidget(QObject):
             proxy_idx = self._source_to_proxy(source_idx)
             if proxy_idx.isValid():
                 self.view.setExpanded(proxy_idx, True)
+
+    @pyqtSlot(int, int)
+    def _on_worker_summary(self, visited: int, skipped: int) -> None:
+        # Cached so ``Window._on_expand_completed`` can read the final
+        # walk totals when ``finished`` arrives. ``summary`` is emitted
+        # *before* ``finished`` so the QueuedConnection ordering
+        # guarantees this slot has run by the time the completion
+        # handler looks at ``_last_summary``.
+        self._last_summary = (visited, skipped)
 
     @pyqtSlot(str)
     def _on_worker_finished(self, status: str) -> None:
@@ -980,6 +1006,11 @@ class _ExpandAllWorker(QObject):
 
     fetch_requested = pyqtSignal(object)  # _FetchBatch
     progress = pyqtSignal(int, str)  # (visited_count, current_path)
+    # Emitted before every ``finished`` so the GUI knows the final
+    # walk totals (visited, skipped). Emitted on every terminal status
+    # — not just ``ok`` — so the GUI can also report partial work
+    # after a cancel or error without parsing logs.
+    summary = pyqtSignal(int, int)  # (visited_count, skipped_count), terminal
     finished = pyqtSignal(str)  # "ok" | "cancelled" | "error"
     failed = pyqtSignal(object)  # Exception
 
@@ -1010,6 +1041,12 @@ class _ExpandAllWorker(QObject):
         self._browsed: set[str] = set()  # NodeId.to_string() values
         self._queue: deque[SyncNode] = deque()
         self._visited: int = 0
+        # Parents the worker dropped during the walk: either a per-node
+        # StatusCode came back not-good, or the per-node retry budget
+        # was exhausted. Surfaced via ``summary`` so the GUI can warn
+        # the user when a walk closed cleanly but silently skipped
+        # parts of the tree.
+        self._skipped_count: int = 0
         # "fast" walks the tree in BFS order with an adaptive batch
         # size: starts at ``INITIAL_BATCH`` (one parent per Browse),
         # doubles on every successful outer iteration up to
@@ -1046,6 +1083,7 @@ class _ExpandAllWorker(QObject):
         self._browsed = set()
         self._queue = deque(start_nodes)
         self._visited = 0
+        self._skipped_count = 0
         # Reset adaptive batch size: we have no information about how
         # big a Browse this server will tolerate until we have tried
         # one, so the first iteration starts at the safe minimum.
@@ -1190,9 +1228,18 @@ class _ExpandAllWorker(QObject):
         ``Node.get_children_descriptions`` (which sets
         ``ReferenceTypeId=HierarchicalReferences`` and
         ``BrowseDirection=Forward``) but in a single batched call.
+
+        ``params.View.Timestamp`` is set to the current UTC time to
+        mirror ``Node.get_references`` exactly — without it some
+        servers (notably the MicroStep server on ``msnc500w3510:62548``
+        which the user reports succeeds on manual expand but fails on
+        Expand All) reject the request with BadViewIdUnknown despite
+        the ViewId being the same default ``NumericNodeId(0)``.
+        ``ViewId`` itself is left at its default; explicit
+        ``ViewId=None`` was tried and regressed freeopcua's encoder.
         """
         params = BrowseParameters()
-        params.View = ua.ViewDescription()
+        params.View.Timestamp = ua.get_win_epoch()
         params.RequestedMaxReferencesPerNode = 0
         params.NodesToBrowse = []
         for node in parents:
@@ -1212,6 +1259,7 @@ class _ExpandAllWorker(QObject):
         try:
             while self._queue:
                 if self._cancelled:
+                    self.summary.emit(self._visited, self._skipped_count)
                     self.finished.emit("cancelled")
                     return
 
@@ -1344,6 +1392,7 @@ class _ExpandAllWorker(QObject):
                                 reconnect_retry = True
                                 break
                             # Cancelled (or reconnect gave up).
+                            self.summary.emit(self._visited, self._skipped_count)
                             self.finished.emit("cancelled")
                             return
                         if len(batch) <= 1:
@@ -1371,6 +1420,7 @@ class _ExpandAllWorker(QObject):
                                 )
                                 time.sleep(self.SINGLE_RETRY_DELAY)
                                 if self._cancelled:
+                                    self.summary.emit(self._visited, self._skipped_count)
                                     self.finished.emit("cancelled")
                                     return
                                 # Loop back and retry the same parent.
@@ -1380,6 +1430,7 @@ class _ExpandAllWorker(QObject):
                                 "%d retries; skipping and continuing the walk",
                                 ex, parents_repr, self.MAX_SINGLE_RETRIES,
                             )
+                            self._skipped_count += 1
                             # Empty results so the result-processing
                             # block below installs no children for
                             # this parent but still increments
@@ -1404,6 +1455,7 @@ class _ExpandAllWorker(QObject):
                         for n in reversed(second_half):
                             self._queue.appendleft(n)
                         if self._cancelled:
+                            self.summary.emit(self._visited, self._skipped_count)
                             self.finished.emit("cancelled")
                             return
                         logger.info(
@@ -1453,11 +1505,13 @@ class _ExpandAllWorker(QObject):
                             "Browse for %s returned %s (%s: %s); skipping",
                             parent.nodeid, sc, sc.name, sc.doc,
                         )
+                        self._skipped_count += 1
                         continue
                     descs = list(br.References)
                     cont = br.ContinuationPoint
                     while cont:
                         if self._cancelled:
+                            self.summary.emit(self._visited, self._skipped_count)
                             self.finished.emit("cancelled")
                             return
                         next_br = self._browse_next_for(cont)
@@ -1487,6 +1541,7 @@ class _ExpandAllWorker(QObject):
                     self._push_children(parent, deduped)
 
                 if self._cancelled:
+                    self.summary.emit(self._visited, self._skipped_count)
                     self.finished.emit("cancelled")
                     return
                 # The current_path is purely cosmetic; reporting the
@@ -1502,12 +1557,14 @@ class _ExpandAllWorker(QObject):
                 # re-emit progress here so the latest ``current_path``
                 # gets displayed.
                 self.progress.emit(self._visited, current_path)
+            self.summary.emit(self._visited, self._skipped_count)
             self.finished.emit("ok")
         except Exception as ex:
             # Defensive: anything that escapes the inner try above
             # still needs to drive the GUI off the wait.
             logger.exception("Expand-all worker crashed")
             self.failed.emit(ex)
+            self.summary.emit(self._visited, self._skipped_count)
             self.finished.emit("error")
 
 
